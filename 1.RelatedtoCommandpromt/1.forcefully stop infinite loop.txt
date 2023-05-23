@@ -1,0 +1,19 @@
+how to stop infinite loop in sublime text or any other plateform using command promt.
+type in command promt:    tasklist
+find file name in list:   write PID  number(ex: 1234)
+for terminate type :   taskkill /PID 1234(pid no.)
+if problem arrise then use : taskkill /F /PID 3455(pid no.)
+
+example:::::::::::::::::::::::::::::::::::::::::::::::::
+C:\Users\raju>tasklist | findstr reverseLinklistItterative
+
+C:\Users\raju>taskkill /PID 18784
+ERROR: The process with PID 18784 could not be terminated.
+Reason: This process can only be terminated forcefully (with /F option).
+
+C:\Users\raju>taskill /F /PID 18784
+'taskill' is not recognized as an internal or external command,
+operable program or batch file.
+
+C:\Users\raju>taskkill /F /PID 18784
+SUCCESS: The process with PID 18784 has been terminated.
