@@ -229,10 +229,11 @@ AS $$
 DECLARE
     v_total_allocated INTEGER;
 BEGIN
+    -- Initialize output
     p_succ_flag := '1';
     p_err_msg := NULL;
 
-    -- Count how many accounts are allocated to this customer
+    -- Step 1: Check total allocated accounts
     SELECT COUNT(*) INTO v_total_allocated
     FROM va_series_inventory_master
     WHERE customer_id = p_customer_id
@@ -240,14 +241,13 @@ BEGIN
       AND bank_entity_id = p_bank_entity_id
       AND va_issue_status = '1';
 
-    -- Check if enough accounts exist
     IF v_total_allocated < p_release_count THEN
         p_succ_flag := '0';
         p_err_msg := 'Not enough accounts allocated to release.';
         RETURN;
     END IF;
 
-    -- Release accounts from highest VA_ACC_NUMBER down
+    -- Step 2: Use a CTE to find accounts to release
     WITH accounts_to_release AS (
         SELECT va_acc_number
         FROM va_series_inventory_master
@@ -258,22 +258,52 @@ BEGIN
         ORDER BY va_acc_number::NUMERIC DESC
         LIMIT p_release_count
     )
+
+    -- Step 3: Release them from inventory
     UPDATE va_series_inventory_master
     SET va_issue_status = '0',
         customer_id = NULL,
         allocation_time = NULL
-    WHERE va_acc_number IN (SELECT va_acc_number FROM accounts_to_release);
+    WHERE va_acc_number IN (SELECT va_acc_number FROM accounts_to_release)
+      AND customer_id = p_customer_id
+      AND series_id = p_series_id
+      AND bank_entity_id = p_bank_entity_id;
 
+    -- Step 4: Add back the range to available_account_ranges
+    INSERT INTO available_account_ranges (
+        bank_entity_id,
+        series_id,
+        start_account,
+        end_account,
+        status
+    )
+    SELECT
+        p_bank_entity_id,
+        p_series_id,
+        MIN(va_acc_number::NUMERIC),
+        MAX(va_acc_number::NUMERIC),
+        'available'
+    FROM accounts_to_release;
+
+    -- Commit the changes
     COMMIT;
 
 EXCEPTION
     WHEN OTHERS THEN
+        -- Handle any error and rollback
         p_succ_flag := '0';
         p_err_msg := 'Error during account release: ' || SQLERRM;
         ROLLBACK;
         RETURN;
 END;
 $$;
+
+
+-----------TABLE AFTER INSERT INTO RANGE TABLE=--------------------
+| bank\_entity\_id | series\_id | start\_account | end\_account | total\_count |
+| ---------------- | ---------- | -------------- | ------------ | ------------ |
+| B001             | S001       | 100006         | 100010       | 5            |
+| B001             | S001       | 100002         | 100003       | 2            |
 
 
 
