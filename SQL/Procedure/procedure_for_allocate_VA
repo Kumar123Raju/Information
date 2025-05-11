@@ -1,0 +1,583 @@
+CREATE OR REPLACE PROCEDURE "mySchema".accountseriesexplore(
+    IN bankentityid character varying,
+    IN seriesid character varying,
+    IN seriesprefix character varying,
+    IN fromaccountid character varying,
+    IN totalaccounts numeric,
+    IN toaccountid character varying,
+    IN checkdigitrequired character varying,
+    IN checkdigitlogic character varying,
+    IN subseriesallocation character varying,
+    INOUT p_err_msg text,
+    INOUT p_succ_flag character
+)
+LANGUAGE plpgsql
+AS $procedure$
+DECLARE
+    batchSize                      CONSTANT INT := 1000;
+    lengthOfFromAccountId          INT := LENGTH(fromAccountId);
+    countNumberofExploredRecords   INT;
+    lastFromAccountId              NUMERIC;
+    accountId                      VARCHAR;
+    subAccPrefixVal                VARCHAR;
+    productPrefix                  VARCHAR;
+    vaIssueStatus                  CHARACTER VARYING(1);
+    subQuery                       VARCHAR;
+    query                          VARCHAR;
+    vaAccNumberWithOrWithoutCheckDigit VARCHAR;
+    lastFromAccountIdWithOrWithoutCheckDigit VARCHAR;
+    v_add_comma                    CHARACTER VARYING(1) := ',';
+    counter                        INT;
+BEGIN
+    -- Initialize variables
+    subAccPrefixVal                    := NULL;
+    productPrefix                      := NULL;
+    vaAccNumberWithOrWithoutCheckDigit := NULL;
+    vaIssueStatus                      := '0';
+    subQuery                           := NULL;
+    p_succ_flag                        := '1';
+    accountId                          := fromAccountId;
+
+    -- Check count of explored records
+    BEGIN
+        SELECT COUNT(1)
+        INTO STRICT countNumberofExploredRecords
+        FROM va_series_inventory_master
+        WHERE BANK_ENTITY_ID = bankEntityId
+          AND SERIES_ID = seriesId;
+    EXCEPTION
+        WHEN OTHERS THEN
+            p_succ_flag := '0';
+            p_err_msg   := 'checkPartialExploredSeriesQry Failed: ' || SQLERRM;
+            RETURN;
+    END;
+
+    -- Initialize last account ID
+    lastFromAccountId := fromAccountId::NUMERIC + countNumberofExploredRecords;
+    accountId := LPAD(lastFromAccountId::VARCHAR, lengthOfFromAccountId, '0');
+
+    -- Generate the VA Account Number (first time)
+    IF checkdigitrequired = 'Y' AND checkdigitlogic = '0' THEN
+        BEGIN
+            SELECT mod10_vaNumber_generate(accountId)
+            INTO STRICT lastFromAccountIdWithOrWithoutCheckDigit
+            FROM DUAL;
+        EXCEPTION
+            WHEN OTHERS THEN
+                p_succ_flag := '0';
+                p_err_msg   := 'Mod10 VA Number Generation Failed: ' || SQLERRM;
+                RETURN;
+        END;
+    ELSIF checkdigitrequired = 'Y' AND checkdigitlogic = '1' THEN
+        BEGIN
+            SELECT custom_vaNumber_generate(accountId)
+            INTO STRICT lastFromAccountIdWithOrWithoutCheckDigit
+            FROM DUAL;
+        EXCEPTION
+            WHEN OTHERS THEN
+                p_succ_flag := '0';
+                p_err_msg   := 'Custom VA Number Generation Failed: ' || SQLERRM;
+                RETURN;
+        END;
+    ELSE
+        lastFromAccountIdWithOrWithoutCheckDigit := accountId;
+    END IF;
+
+    vaAccNumberWithOrWithoutCheckDigit := COALESCE(seriesPrefix, '') || lastFromAccountIdWithOrWithoutCheckDigit;
+
+    -- Start looping
+    counter := 0;
+    WHILE countNumberofExploredRecords < totalaccounts LOOP
+        counter := counter + 1;
+        countNumberofExploredRecords := countNumberofExploredRecords + 1;
+
+        -- Build the subquery for batch insert
+        subQuery := COALESCE(subQuery, '') ||
+                    '(' ||
+                        quote_literal(bankEntityId) || ',' ||
+                        quote_literal(seriesId) || ',' ||
+                        quote_literal(COALESCE(productPrefix, '')) || ',' ||
+                        quote_literal(COALESCE(subAccPrefixVal, '')) || ',' ||
+                        quote_literal(vaAccNumberWithOrWithoutCheckDigit) || ',' ||
+                        quote_literal(vaIssueStatus) ||
+                    ')';
+
+        -- Execute batch insert when batch size is met or last record
+        IF counter = batchSize OR countNumberofExploredRecords = totalaccounts THEN
+            BEGIN
+                query := 'INSERT INTO va_series_inventory_master
+                            (BANK_ENTITY_ID, SERIES_ID, VA_PRODUCT_ID, SUB_ACC_PREFIX_VAL, VA_ACC_NUMBER, VA_ISSUE_STATUS)
+                          VALUES ' || subQuery;
+                EXECUTE query;
+
+                -- Update series exploration status
+                IF countNumberofExploredRecords = totalaccounts THEN
+                    UPDATE VA_ACCOUNT_SERIES_MASTER
+                    SET SERIES_EXPLOSION_STATUS = 'P'
+                    WHERE BANK_ENTITY_ID = bankEntityId AND SERIES_ID = seriesId;
+                ELSE
+                    UPDATE VA_ACCOUNT_SERIES_MASTER
+                    SET SERIES_EXPLOSION_STATUS = 'H'
+                    WHERE BANK_ENTITY_ID = bankEntityId AND SERIES_ID = seriesId;
+                END IF;
+            EXCEPTION
+                WHEN UNIQUE_VIOLATION THEN
+                    p_succ_flag := '0';
+                    p_err_msg   := 'Primary key violation: ' || SQLERRM;
+
+                    -- Set status to Failed and clean up
+                    UPDATE VA_ACCOUNT_SERIES_MASTER
+                    SET SERIES_EXPLOSION_STATUS = 'F'
+                    WHERE BANK_ENTITY_ID = bankEntityId AND SERIES_ID = seriesId;
+
+                    DELETE FROM VA_SERIES_INVENTORY_MASTER
+                    WHERE BANK_ENTITY_ID = bankEntityId AND SERIES_ID = seriesId;
+
+                    COMMIT;
+                    RETURN;
+                WHEN OTHERS THEN
+                    p_succ_flag := '0';
+                    p_err_msg   := 'Series exploration process failed: ' || SQLERRM;
+                    ROLLBACK;
+                    RETURN;
+            END;
+
+            COMMIT;
+            subQuery := NULL;
+            counter := 0;
+        ELSE
+            subQuery := subQuery || v_add_comma;
+        END IF;
+
+        -- Prepare for next loop: increment account ID and regenerate VA number
+        lastFromAccountId := lastFromAccountId + 1;
+        accountId := LPAD(lastFromAccountId::VARCHAR, lengthOfFromAccountId, '0');
+
+        IF checkdigitrequired = 'Y' AND checkdigitlogic = '0' THEN
+            BEGIN
+                SELECT mod10_vaNumber_generate(accountId)
+                INTO STRICT lastFromAccountIdWithOrWithoutCheckDigit
+                FROM DUAL;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    p_succ_flag := '0';
+                    p_err_msg   := 'Mod10 VA Number Generation Failed: ' || SQLERRM;
+                    RETURN;
+            END;
+        ELSIF checkdigitrequired = 'Y' AND checkdigitlogic = '1' THEN
+            BEGIN
+                SELECT custom_vaNumber_generate(accountId)
+                INTO STRICT lastFromAccountIdWithOrWithoutCheckDigit
+                FROM DUAL;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    p_succ_flag := '0';
+                    p_err_msg   := 'Custom VA Number Generation Failed: ' || SQLERRM;
+                    RETURN;
+            END;
+        ELSE
+            lastFromAccountIdWithOrWithoutCheckDigit := accountId;
+        END IF;
+
+        vaAccNumberWithOrWithoutCheckDigit := COALESCE(seriesPrefix, '') || lastFromAccountIdWithOrWithoutCheckDigit;
+    END LOOP;
+END;
+$procedure$;
+
+
+
+
+
+
+
+CREATE OR REPLACE PROCEDURE mySchema.reduceAccountUpdate(
+    IN p_customer_id VARCHAR,
+    IN p_series_id VARCHAR,
+    IN p_bank_entity_id VARCHAR,
+    IN p_release_count INTEGER,
+    INOUT p_err_msg TEXT,
+    INOUT p_succ_flag CHAR
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_total_allocated INTEGER;
+BEGIN
+    p_succ_flag := '1';
+    p_err_msg := NULL;
+
+    -- Count how many accounts are allocated to this customer
+    SELECT COUNT(*) INTO v_total_allocated
+    FROM va_series_inventory_master
+    WHERE customer_id = p_customer_id
+      AND series_id = p_series_id
+      AND bank_entity_id = p_bank_entity_id
+      AND va_issue_status = '1';
+
+    -- Check if enough accounts exist
+    IF v_total_allocated < p_release_count THEN
+        p_succ_flag := '0';
+        p_err_msg := 'Not enough accounts allocated to release.';
+        RETURN;
+    END IF;
+
+    -- Release accounts from highest VA_ACC_NUMBER down
+    WITH accounts_to_release AS (
+        SELECT va_acc_number
+        FROM va_series_inventory_master
+        WHERE customer_id = p_customer_id
+          AND series_id = p_series_id
+          AND bank_entity_id = p_bank_entity_id
+          AND va_issue_status = '1'
+        ORDER BY va_acc_number::NUMERIC DESC
+        LIMIT p_release_count
+    )
+    UPDATE va_series_inventory_master
+    SET va_issue_status = '0',
+        customer_id = NULL,
+        allocation_time = NULL
+    WHERE va_acc_number IN (SELECT va_acc_number FROM accounts_to_release);
+
+    COMMIT;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        p_succ_flag := '0';
+        p_err_msg := 'Error during account release: ' || SQLERRM;
+        ROLLBACK;
+        RETURN;
+END;
+$$;
+
+
+
+
+
+
+
+
+CREATE OR REPLACE PROCEDURE allocate_sequential_virtual_accounts(
+    IN p_bank_entity_id VARCHAR,
+    IN p_series_id VARCHAR,
+    IN p_customer_id VARCHAR,
+    IN p_required_accounts INT,
+    INOUT p_err_msg TEXT,
+    INOUT p_success_flag CHAR
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    start_acc_number NUMERIC;
+    end_acc_number NUMERIC;
+BEGIN
+    p_success_flag := '1';
+    p_err_msg := NULL;
+
+    -- Lock table for consistency (optional but safer)
+    LOCK TABLE va_series_inventory_master IN SHARE ROW EXCLUSIVE MODE;
+
+    -- Step 1: Find starting point of a continuous block
+    SELECT va_acc_number::NUMERIC INTO start_acc_number
+    FROM (
+        SELECT va_acc_number,
+               ROW_NUMBER() OVER (ORDER BY va_acc_number::NUMERIC) AS rn,
+               va_acc_number::NUMERIC - ROW_NUMBER() OVER (ORDER BY va_acc_number::NUMERIC)::NUMERIC AS grp
+        FROM va_series_inventory_master
+        WHERE bank_entity_id = p_bank_entity_id
+          AND series_id = p_series_id
+          AND va_issue_status = '0'
+    ) AS sub
+    GROUP BY grp
+    HAVING COUNT(*) >= p_required_accounts
+    ORDER BY MIN(va_acc_number::NUMERIC)
+    LIMIT 1;
+
+    -- Step 2: If no block found, exit
+    IF start_acc_number IS NULL THEN
+        p_success_flag := '0';
+        p_err_msg := 'No contiguous block of available accounts found.';
+        RETURN;
+    END IF;
+
+    end_acc_number := start_acc_number + p_required_accounts - 1;
+
+    -- Step 3: Recheck availability in the exact range
+    IF EXISTS (
+        SELECT 1
+        FROM va_series_inventory_master
+        WHERE bank_entity_id = p_bank_entity_id
+          AND series_id = p_series_id
+          AND va_issue_status <> '0'
+          AND va_acc_number::NUMERIC BETWEEN start_acc_number AND end_acc_number
+    ) THEN
+        p_success_flag := '0';
+        p_err_msg := 'Some accounts in the required range are already assigned.';
+        RETURN;
+    END IF;
+
+    -- Step 4: Update accounts in the found block
+    UPDATE va_series_inventory_master
+    SET va_issue_status = '1',
+        customer_id = p_customer_id,
+        allocation_time = CURRENT_TIMESTAMP
+    WHERE bank_entity_id = p_bank_entity_id
+      AND series_id = p_series_id
+      AND va_acc_number::NUMERIC BETWEEN start_acc_number AND end_acc_number;
+
+    -- Optional message
+    p_err_msg := format(
+        'Accounts %s to %s allocated to customer %s.',
+        start_acc_number, end_acc_number, p_customer_id
+    );
+
+EXCEPTION
+    WHEN OTHERS THEN
+        p_success_flag := '0';
+        p_err_msg := 'Unexpected error: ' || SQLERRM;
+        RAISE;
+END;
+$$;
+
+
+
+
+
+
+
+
+
+
+
+//
+
+
+
+
+CREATE OR REPLACE PROCEDURE allocate_sequential_virtual_accounts(
+    IN customer_id VARCHAR,
+    IN series_id VARCHAR,
+    IN bank_entity_id VARCHAR,
+    IN requested_accounts INTEGER,
+    INOUT p_err_msg TEXT,
+    INOUT p_succ_flag CHAR
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    range_row RECORD;
+    available_start BIGINT;
+    available_end BIGINT;
+    allocate_end BIGINT;
+    i BIGINT;
+    current_account VARCHAR(50);
+BEGIN
+    p_succ_flag := '1';
+    p_err_msg := '';
+
+    -- Find a suitable available range
+    FOR range_row IN
+        SELECT *
+        FROM available_account_ranges
+        WHERE series_id = series_id
+          AND bank_entity_id = bank_entity_id
+          AND total_count >= requested_accounts
+        ORDER BY start_account::BIGINT
+        LIMIT 1
+    LOOP
+        available_start := range_row.start_account::BIGINT;
+        available_end := range_row.end_account::BIGINT;
+        allocate_end := available_start + requested_accounts - 1;
+
+        -- Allocate accounts from inventory
+        FOR i IN available_start..allocate_end LOOP
+            current_account := LPAD(i::TEXT, 10, '0');
+
+            UPDATE va_series_inventory_master
+            SET va_issue_status = '2', customer_id = customer_id
+            WHERE va_acc_number = current_account
+              AND va_issue_status = '1';
+
+            -- Optional: check row_count = 1 for safety
+        END LOOP;
+
+        -- Update the available_account_ranges table
+        IF allocate_end = available_end THEN
+            -- Entire range used, remove the row
+            DELETE FROM available_account_ranges WHERE id = range_row.id;
+        ELSE
+            -- Partial use, update start_account and total_count
+            UPDATE available_account_ranges
+            SET start_account = (allocate_end + 1)::VARCHAR,
+                total_count = total_count - requested_accounts
+            WHERE id = range_row.id;
+        END IF;
+
+        p_err_msg := 'Successfully allocated accounts from ' || available_start || ' to ' || allocate_end;
+        RETURN;
+    END LOOP;
+
+    -- No available range found
+    p_succ_flag := '0';
+    p_err_msg := 'No available range found for the requested ' || requested_accounts || ' accounts.';
+    ROLLBACK;
+END;
+$$;
+
+
+
+
+
+-------------------after adding multiseries----------------------------------------------------------
+CREATE OR REPLACE PROCEDURE allocate_accounts_from_multiseries(
+    IN p_customer_id VARCHAR,
+    INOUT p_err_msg TEXT,
+    INOUT p_succ_flag CHAR
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    series_row RECORD;
+    available_start BIGINT;
+    available_end BIGINT;
+    allocate_end BIGINT;
+    i BIGINT;
+    current_account VARCHAR(50);
+BEGIN
+    p_succ_flag := '1';
+    p_err_msg := '';
+
+    -- Start transaction explicitly
+    BEGIN
+        -- Loop through each series for this customer
+        FOR series_row IN
+            SELECT *
+            FROM multiseries
+            WHERE customer_id = p_customer_id
+        LOOP
+            -- Find available range
+            SELECT *
+            INTO STRICT series_row
+            FROM available_account_ranges
+            WHERE bank_entity_id = series_row.bank_entity_id
+              AND series_id = series_row.series_id
+              AND total_count >= series_row.requested_accounts
+            ORDER BY start_account::BIGINT
+            LIMIT 1;
+
+            -- Compute allocation range
+            available_start := series_row.start_account::BIGINT;
+            available_end := series_row.end_account::BIGINT;
+            allocate_end := available_start + series_row.requested_accounts - 1;
+
+            -- Allocate from inventory
+            FOR i IN available_start..allocate_end LOOP
+                current_account := LPAD(i::TEXT, 10, '0');
+
+                UPDATE va_series_inventory_master
+                SET va_issue_status = '2',
+                    customer_id = p_customer_id
+                WHERE va_acc_number = current_account
+                  AND bank_entity_id = series_row.bank_entity_id
+                  AND series_id = series_row.series_id
+                  AND va_issue_status = '1';
+
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'Failed to update account % for series %', current_account, series_row.series_id;
+                END IF;
+            END LOOP;
+
+            -- Update available_account_ranges
+            IF allocate_end = available_end THEN
+                DELETE FROM available_account_ranges
+                WHERE bank_entity_id = series_row.bank_entity_id
+                  AND series_id = series_row.series_id
+                  AND start_account = series_row.start_account
+                  AND end_account = series_row.end_account;
+            ELSE
+                UPDATE available_account_ranges
+                SET start_account = (allocate_end + 1)::VARCHAR,
+                    total_count = total_count - series_row.requested_accounts
+                WHERE bank_entity_id = series_row.bank_entity_id
+                  AND series_id = series_row.series_id
+                  AND start_account = series_row.start_account
+                  AND end_account = series_row.end_account;
+            END IF;
+        END LOOP;
+
+        COMMIT;
+        p_succ_flag := '1';
+        p_err_msg := 'All allocations succeeded.';
+        RETURN;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            p_succ_flag := '0';
+            p_err_msg := 'Failed to allocate accounts: ' || SQLERRM;
+            RETURN;
+    END;
+END;
+$$;
+
+
+
+
+
+
+
++-----------------+------------+--------------+------------+-----------------+------------+
+| bank_entity_id  | series_id  | start_account| end_account| available_count | status     |
++-----------------+------------+--------------+------------+-----------------+------------+
+| '0096'          | 'BM20250211162562' | 1  | 10         | 10              | 'RESERVED' |
+| '0096'          | 'BM20250211162562' | 11 | 25         | 15              | 'RESERVED' |
+| '0096'          | 'BM20250211162562' | 26 | 49         | 24              | 'RESERVED' |
+| '0096'          | 'BM20250211162562' | 50 | 100        | 51              | 'AVAILABLE'|
++-----------------+------------+--------------+------------+-----------------+------------+
+
+
+
+
+
+
+
+
++-----------------+------------+--------------+------------+-----------------+------------+
+| bank_entity_id  | series_id  | start_account| end_account| available_count | status     |
++-----------------+------------+--------------+------------+-----------------+------------+
+| '0096'          | 'BM20250211162562' | 1  | 10         | 10              | 'RESERVED' |
+| '0096'          | 'BM20250211162562' | 11 | 20         | 10              | 'RESERVED' |
+| '0096'          | 'BM20250211162562' | 21 | 25         | 5               | 'AVAILABLE'|
+| '0096'          | 'BM20250211162562' | 26 | 49         | 24              | 'RESERVED' |
+| '0096'          | 'BM20250211162562' | 50 | 100        | 51              | 'AVAILABLE'|
++-----------------+------------+--------------+------------+-----------------+------------+
+
+
+
+
+---------------------accseriesexplore procedure will add this ---------------------------------
+IF subseriesallocation = 'Y' THEN
+    BEGIN
+        INSERT INTO available_account_ranges (
+            bank_entity_id,
+            series_id,
+            start_account,
+            end_account,
+            total_count
+        )
+        VALUES (
+            bankEntityId,
+            seriesId,
+            fromAccountId,
+            toAccountId,
+            totalAccounts
+        );
+    EXCEPTION
+        WHEN OTHERS THEN
+            p_succ_flag := '0';
+            p_err_msg   := 'Failed to insert into available_account_ranges: ' || SQLERRM;
+            ROLLBACK;
+            RETURN;
+    END;
+END IF;
+
+ 00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 
