@@ -181,6 +181,32 @@ BEGIN
 
         vaAccNumberWithOrWithoutCheckDigit := COALESCE(seriesPrefix, '') || lastFromAccountIdWithOrWithoutCheckDigit;
     END LOOP;
+             IF p_succ_flag = '1' AND subseriesallocation = 'Y' THEN
+                        BEGIN
+                            INSERT INTO available_account_ranges (
+                                bank_entity_id,
+                                series_id,
+                                start_account,
+                                end_account,
+                                total_count
+                            )
+                            VALUES (
+                                bankEntityId,
+                                seriesId,
+                                fromAccountId,
+                                toAccountId,
+                                totalAccounts
+                            );
+                        EXCEPTION
+                            WHEN OTHERS THEN
+                                p_succ_flag := '0';
+                                p_err_msg   := 'Failed to insert into available_account_ranges: ' || SQLERRM;
+                                ROLLBACK;
+                                RETURN;
+                        END;
+                    END IF;
+
+
 END;
 $procedure$;
 
@@ -581,3 +607,16 @@ IF subseriesallocation = 'Y' THEN
 END IF;
 
  00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 
+-----------------------TABLE DETAILS --------------------------------------------------------------------------------------
+TABLE TO STORE RANGE: 
+CREATE TABLE available_account_ranges (
+    bank_entity_id VARCHAR NOT NULL,
+    series_id VARCHAR NOT NULL,
+    start_account NUMERIC NOT NULL,
+    end_account NUMERIC NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'available',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (bank_entity_id, series_id, start_account, end_account)
+);
+
